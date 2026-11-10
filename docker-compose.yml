@@ -1,0 +1,20 @@
+services:
+  subtitle-alignment:
+    build: .
+    ports:
+      - "8085:8085"
+    env_file:
+      - .env
+    volumes:
+      - movie-library-smb-rw:/movies
+      - ./data:/data
+    restart: unless-stopped
+
+volumes:
+  movie-library-smb-rw:
+    driver: local
+    driver_opts:
+      type: cifs
+      device: "//${SMB_SERVER}/Media"
+      o: "addr=${SMB_SERVER},vers=${SMB_VERSION:-3.0},sec=ntlmssp,nounix,iocharset=utf8,username=${SMB_USERNAME},password=${SMB_PASSWORD},prefixpath=MovieTest,rw"
+
