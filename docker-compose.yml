@@ -8,6 +8,7 @@ services:
     volumes:
       - movie-library-smb-rw:/movies
       - ./data:/data
+      - ./alignment-analysis:/alignment-analysis:ro
     restart: unless-stopped
 
 volumes:
@@ -16,5 +17,5 @@ volumes:
     driver_opts:
       type: cifs
       device: "//${SMB_SERVER}/Media"
-      o: "addr=${SMB_SERVER},vers=${SMB_VERSION:-3.0},sec=ntlmssp,nounix,iocharset=utf8,username=${SMB_USERNAME},password=${SMB_PASSWORD},prefixpath=MovieTest,rw"
+      o: "addr=${SMB_SERVER},vers=${SMB_VERSION:-3.0},sec=ntlmssp,nounix,iocharset=utf8,username=${SMB_USERNAME},password=${SMB_PASSWORD},rw"
 

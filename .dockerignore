@@ -1,0 +1,9 @@
+.git
+.env
+.venv
+data
+transcriptions
+alignment-analysis
+__pycache__
+**/__pycache__
+.DS_Store
