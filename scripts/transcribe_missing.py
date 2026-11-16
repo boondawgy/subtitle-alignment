@@ -153,6 +153,9 @@ def run_movie(movie, args, ratings, model):
     atomic_json(output, record)
     return output
 
+def load_current_movie(state_path, path):
+    return json.loads(state_path.read_text(encoding='utf-8')).get('movies', {}).get(path)
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--state', type=Path, default=ROOT/'data/state.json')
@@ -168,6 +171,7 @@ def main():
     parser.add_argument('--beam-size', type=int, default=1)
     parser.add_argument('--sample-seconds', type=int, default=60)
     parser.add_argument('--skip-seconds', type=int, default=300)
+    parser.add_argument('--title', action='append', help='Only process this exact movie title; repeat for multiple movies')
     parser.add_argument('--limit', type=int, help='Process at most this many movies, including failures')
     parser.add_argument('--list', action='store_true', help='List the queue without loading the model')
     args = parser.parse_args()
@@ -176,7 +180,13 @@ def main():
     try:
         ratings = read_ratings(args.ratings)
         state = json.loads(args.state.read_text(encoding='utf-8'))
-        movies = [m for m in state.get('movies', {}).values() if m.get('path') and m.get('title') and not m.get('has_subtitles') and (m.get('embedded_checked') or m.get('has_sidecar'))]
+        movies = [m for m in state.get('movies', {}).values() if m.get('path') and m.get('title') and not m.get('has_subtitles') and not m.get('passed') and (m.get('embedded_checked') or m.get('has_sidecar'))]
+        if args.title:
+            wanted = {title.casefold() for title in args.title}
+            movies = [m for m in movies if m['title'].casefold() in wanted]
+            missing = wanted - {m['title'].casefold() for m in movies}
+            if missing:
+                raise ValueError('Requested movie not found in the eligible library: ' + ', '.join(sorted(missing)))
         movies.sort(key=lambda m: movie_priority(m, ratings))
     except (OSError, ValueError, json.JSONDecodeError) as exc:
         print(f'Cannot load movie queue: {exc}', file=sys.stderr); return 1
@@ -192,15 +202,22 @@ def main():
         model = WhisperModel(args.model, device=args.device, compute_type=args.compute_type)
     except Exception as exc:
         print(f'Could not load faster-whisper model: {exc}', file=sys.stderr); return 1
-    failures = 0
+    failures = 0; completed = 0; skipped = 0
     for index, movie in enumerate(movies, 1):
         print(f'[{index}/{len(movies)}] {movie["title"]}', flush=True)
         try:
+            current=load_current_movie(args.state, movie['path'])
+            if current is None or current.get('passed') or current.get('has_subtitles'):
+                print('  Skipped: movie is passed, completed, or no longer in the library.', flush=True)
+                skipped += 1
+                continue
+            movie=current
             out = run_movie(movie, args, ratings, model)
+            completed += 1
             print(f'  Saved {out}', flush=True)
         except Exception as exc:
             failures += 1; print(f'  Failed: {exc}', file=sys.stderr, flush=True)
-    print(f'Finished: {len(movies)-failures} completed, {failures} failed.', flush=True)
+    print(f'Finished: {completed} completed, {skipped} skipped, {failures} failed.', flush=True)
     return 1 if failures else 0
 
 if __name__ == '__main__':

@@ -4,6 +4,7 @@ from difflib import SequenceMatcher
 from datetime import datetime, timezone
 import math
 from pathlib import Path
+from urllib.parse import urlsplit, urljoin
 from flask import Flask, jsonify, render_template, request, send_file
 import requests
 
@@ -40,6 +41,102 @@ def update_movie(path, updates, **state_updates):
         state.update(state_updates)
         save_state(state)
 
+class OpenSubtitlesError(Exception):
+    pass
+
+_auth_lock = threading.RLock()
+_auth_token = None
+_auth_base = "https://api.opensubtitles.com/api/v1"
+_auth_blocked = False
+
+def opensubtitles_credentials():
+    username = os.getenv("OPENSUBTITLES_USERNAME", "").strip()
+    password = os.getenv("OPENSUBTITLES_PASSWORD", "")
+    if bool(username) != bool(password):
+        raise OpenSubtitlesError("Set both OPENSUBTITLES_USERNAME and OPENSUBTITLES_PASSWORD in .env, then restart the app.")
+    return username, password
+
+def opensubtitles_identity():
+    username = os.getenv("OPENSUBTITLES_USERNAME", "").strip()
+    return "account:" + hashlib.sha256(username.casefold().encode()).hexdigest() if username else "anonymous"
+
+def opensubtitles_base_url(value):
+    if not value:
+        return "https://api.opensubtitles.com/api/v1"
+    parsed = urlsplit(value if "://" in value else "https://" + value)
+    if parsed.scheme != "https" or parsed.netloc not in {"api.opensubtitles.com", "vip-api.opensubtitles.com"} or parsed.path not in ("", "/", "/api/v1", "/api/v1/") or parsed.query or parsed.fragment:
+        raise OpenSubtitlesError("OpenSubtitles returned an unsupported API host.")
+    return "https://" + parsed.netloc + "/api/v1"
+
+def opensubtitles_headers(token=None):
+    headers = {"Api-Key": os.getenv("OPENSUBTITLES_CONSUMER_KEY", os.getenv("OPENSUBTITLES_API_KEY", "")),
+               "User-Agent": os.getenv("OPENSUBTITLES_USER_AGENT", "subtitle-alignment-local")}
+    if token: headers["Authorization"] = "Bearer " + token
+    return headers
+
+def opensubtitles_token():
+    global _auth_token, _auth_base, _auth_blocked
+    username, password = opensubtitles_credentials()
+    if not username: return None, "https://api.opensubtitles.com/api/v1"
+    with _auth_lock:
+        if _auth_blocked:
+            raise OpenSubtitlesError("OpenSubtitles login was rejected. Check the username, password and API key, then restart the app.")
+        if _auth_token: return _auth_token, _auth_base
+        try:
+            response = requests.post("https://api.opensubtitles.com/api/v1/login", json={"username": username, "password": password}, headers=opensubtitles_headers(), timeout=30, allow_redirects=False)
+        except Exception as exc:
+            raise OpenSubtitlesError("Could not reach OpenSubtitles to sign in.") from exc
+        if response.status_code == 401:
+            _auth_blocked = True
+            raise OpenSubtitlesError("OpenSubtitles login was rejected. Check the username, password and API key, then restart the app.")
+        if not response.ok:
+            raise OpenSubtitlesError(f"OpenSubtitles login failed (HTTP {response.status_code}).")
+        try:
+            body = response.json(); token = body.get("token")
+            if not isinstance(token, str) or not token: raise ValueError("missing token")
+            base = opensubtitles_base_url(body.get("base_url"))
+        except (ValueError, TypeError, AttributeError) as exc:
+            raise OpenSubtitlesError("OpenSubtitles returned an invalid login response.") from exc
+        _auth_token, _auth_base = token, base
+        return token, base
+
+def opensubtitles_request(method, endpoint, **kwargs):
+    global _auth_token, _auth_blocked
+    token, base = opensubtitles_token()
+    for attempt in range(2):
+        url = base + endpoint
+        request_kwargs = dict(kwargs)
+        for redirects in range(4):
+            try:
+                response = getattr(requests, method)(url, headers=opensubtitles_headers(token), timeout=30, allow_redirects=False, **request_kwargs)
+            except Exception as exc:
+                raise OpenSubtitlesError("Could not reach OpenSubtitles. Please try again.") from exc
+            status = getattr(response, "status_code", 200)
+            if method.lower() == "get" and status in (301, 302, 303, 307, 308):
+                location = response.headers.get("Location")
+                if not location or redirects == 3:
+                    raise OpenSubtitlesError("OpenSubtitles returned an invalid search redirect.")
+                target = urljoin(url, location)
+                parsed = urlsplit(target)
+                if parsed.scheme != "https" or parsed.netloc != urlsplit(base).netloc or not parsed.path.startswith("/api/v1/") or parsed.fragment:
+                    raise OpenSubtitlesError("OpenSubtitles returned an untrusted search redirect.")
+                url = target
+                request_kwargs.pop("params", None)
+                continue
+            if 300 <= status < 400:
+                raise OpenSubtitlesError("OpenSubtitles returned an unexpected redirect.")
+            break
+        if status != 401 or not token:
+            return response
+        with _auth_lock:
+            if attempt == 1:
+                _auth_token = None
+                _auth_blocked = True
+                raise OpenSubtitlesError("OpenSubtitles rejected the account token. Check your account and API key, then restart the app.")
+            if _auth_token == token: _auth_token = None
+        token, base = opensubtitles_token()
+    return response
+
 def record_api_response(response, download=False):
     """Persist the last reported values, including for failed downloads."""
     now = datetime.now(timezone.utc).isoformat()
@@ -55,7 +152,7 @@ def record_api_response(response, download=False):
             try:
                 body = response.json()
                 if isinstance(body, dict) and body.get("remaining") is not None:
-                    state.update(downloads_remaining=body["remaining"], downloads_updated_at=now)
+                    state.update(downloads_remaining=body["remaining"], downloads_updated_at=now, downloads_identity=opensubtitles_identity())
             except (ValueError, TypeError):
                 pass
         else:
@@ -84,15 +181,18 @@ def available_tracks(movie, analysis):
     if not history and movie.get("working_srt") and movie.get("current_candidate_id") is not None:
         history = [{"id":movie["current_candidate_id"], "name":movie.get("current_candidate_name", "Downloaded subtitle"), "file":movie["working_srt"]}]
     result=[]
+    rejected=set(map(str, movie.get("rejected_ids", [])))
     for entry in history:
         if not entry.get("file") or not Path(entry["file"]).is_file(): continue
         digest=track_digest(entry["file"]) if analysis else None
         match=next((t for t in analysis if str(t.get("track_id"))==str(entry.get("id")) and t.get("subtitle_sha256") and t.get("subtitle_sha256")==digest and t.get("status")=="analyzed"), None)
         score=match.get("fit_score") if match else None
         offset=match.get("recommended_offset_seconds") if match else None
+        if entry.get("recommended_offset_seconds") is not None:
+            offset=entry["recommended_offset_seconds"]
         if not isinstance(score,(int,float)) or isinstance(score,bool) or not math.isfinite(score) or not 0 <= score <= 100: score=None
         if not isinstance(offset,(int,float)) or isinstance(offset,bool) or not math.isfinite(offset): offset=None
-        result.append({"id":entry["id"], "name":entry.get("name", "Downloaded subtitle"), "fit_score":score, "recommended_offset_seconds":offset})
+        result.append({"id":entry["id"], "name":entry.get("name", "Downloaded subtitle"), "fit_score":score, "recommended_offset_seconds":offset, "rejected":str(entry["id"]) in rejected})
     return result
 
 def has_subtitle_sidecar(p):
@@ -131,13 +231,18 @@ def discover_library():
                     continue
                 key = str(p.resolve()); found.add(key)
                 sidecar = has_subtitle_sidecar(p)
+                stat = p.stat()
                 with lock:
                     state = load_state(); old = state.setdefault("movies", {}).get(key, {})
                     embedded = old.get("has_embedded")
-                    if "has_embedded" not in old and old.get("embedded_checked") and not old.get("has_subtitles"):
-                        embedded = False
+                    # A cached probe is only valid for the same file. This also
+                    # rechecks legacy entries that have no stored fingerprint.
+                    if (old.get("movie_size") != stat.st_size or
+                            old.get("movie_mtime_ns") != stat.st_mtime_ns):
+                        embedded = None
                     checked = embedded is not None
                     old.update(path=key, title=p.stem, has_sidecar=sidecar,
+                               movie_size=stat.st_size, movie_mtime_ns=stat.st_mtime_ns,
                                has_embedded=embedded, embedded_checked=checked,
                                has_subtitles=sidecar or embedded is True)
                     state["movies"][key] = old; save_state(state)
@@ -230,7 +335,7 @@ def movies():
         for movie in state.get("movies", {}).values():
             m = dict(movie)
             tracks=available_tracks(m, analyses.get(m.get("path"), []))
-            scores=[t["fit_score"] for t in tracks if t["fit_score"] is not None]
+            scores=[t["fit_score"] for t in tracks if t["fit_score"] is not None and not t["rejected"]]
             m["track_count"] = len(tracks)
             m["best_fit_score"] = max(scores) if scores else None
             m["scan_status"] = "ready" if m.get("embedded_checked") or m.get("has_sidecar") else ("error" if m.get("scan_error") or not discovery_started else "analyzing")
@@ -240,11 +345,40 @@ def movies():
         return jsonify(movies=result, scanning=discovery_started, scan_progress=dict(scan_progress), scan_error=state.get("scan_error"),
                        lookups=state.get("api_lookups", 0), rate_remaining=state.get("api_rate_remaining"),
                        rate_limit=state.get("api_rate_limit"), rate_reset=state.get("api_rate_reset"),
-                       downloads_remaining=state.get("downloads_remaining"), rate_updated_at=state.get("api_rate_updated_at"), downloads_updated_at=state.get("downloads_updated_at"))
+                       downloads_remaining=state.get("downloads_remaining") if state.get("downloads_identity", "anonymous") == opensubtitles_identity() else None,
+                       rate_updated_at=state.get("api_rate_updated_at"), downloads_updated_at=state.get("downloads_updated_at") if state.get("downloads_identity", "anonymous") == opensubtitles_identity() else None,
+                       auth_status="account rejected" if _auth_blocked else ("account signed in" if _auth_token else ("account configured" if os.getenv("OPENSUBTITLES_USERNAME", "").strip() else "anonymous")))
 
 @app.post("/api/refresh")
 def refresh_library():
     return jsonify(ok=True, started=start_scan())
+
+@app.post("/api/pass-movie")
+def pass_movie():
+    data=request.get_json(silent=True)
+    if not isinstance(data, dict) or not isinstance(data.get("passed"), bool):
+        return jsonify(error="Expected a movie path and a true or false pass value"), 400
+    p=movie_or_404(data.get("path"))
+    if not p: return jsonify(error="Invalid movie"), 400
+    with lock:
+        state=load_state(); movie=state.get("movies", {}).get(str(p))
+        if not movie: return jsonify(error="Movie not found in library"), 404
+        movie["passed"]=data["passed"]
+        save_state(state)
+    return jsonify(ok=True, passed=data["passed"])
+
+@app.post("/api/movie-identifier")
+def set_movie_identifier():
+    data=request.get_json(silent=True)
+    if not isinstance(data, dict): return jsonify(error="Invalid request"), 400
+    p=movie_or_404(data.get("path")); raw=data.get("imdb_id")
+    match=re.fullmatch(r"tt(\d{5,12})", str(raw or ""))
+    if not p or not match: return jsonify(error="Invalid movie or IMDb ID"), 400
+    with lock:
+        state=load_state();movie=state.get("movies",{}).get(str(p))
+        if not movie: return jsonify(error="Movie not found in library"), 404
+        movie["imdb_id"]='tt'+match.group(1);save_state(state)
+    return jsonify(ok=True)
 
 @app.post("/api/analyze")
 def api_analyze():
@@ -292,16 +426,46 @@ def candidate_rank(item, title, year):
 def api_search():
     path=request.json.get("path"); p=movie_or_404(path); s=load_state(); m=s.get("movies",{}).get(str(p))
     if not p or not m: return jsonify(error="Invalid movie"),400
-    headers={"Api-Key":os.getenv("OPENSUBTITLES_CONSUMER_KEY",os.getenv("OPENSUBTITLES_API_KEY","")),"User-Agent":os.getenv("OPENSUBTITLES_USER_AGENT","subtitle-alignment-local")}
-    year_match=re.search(r"(?<!\d)((?:19|20)\d{2})(?!\d)",m["title"]); params={"query":re.sub(r"[. _-]+", " ", m["title"][:year_match.start()].strip(" ._-(") if year_match else m["title"]),"languages":"en","order_by":"download_count","order_direction":"desc","page":1}
+    try:
+        page = int(request.json.get("page", 1))
+        if page < 1: raise ValueError()
+    except (ValueError, TypeError):
+        return jsonify(error="Invalid search page"), 400
+    year_match=re.search(r"(?<!\d)((?:19|20)\d{2})(?!\d)",m["title"]); params={"query":re.sub(r"[. _-]+", " ", m["title"][:year_match.start()].strip(" ._-(") if year_match else m["title"]),"languages":"en","order_by":"download_count","order_direction":"desc","page":page}
     if year_match: params["year"]=year_match.group(1)
-    r=requests.get("https://api.opensubtitles.com/api/v1/subtitles", params=params, headers=headers, timeout=30)
+    imdb_id = request.json.get("imdb_id") or m.get("imdb_id")
+    if imdb_id:
+        imdb_match = re.fullmatch(r"(?:tt)?(\d{1,12})", str(imdb_id))
+        if not imdb_match: return jsonify(error="Invalid IMDb ID"), 400
+        imdb_id = int(imdb_match.group(1))
+        params.pop("query", None)
+        params.pop("year", None)
+        params.update(imdb_id=imdb_id, type="movie")
+    try:
+        r=opensubtitles_request("get", "/subtitles", params=params)
+    except OpenSubtitlesError as exc:
+        return jsonify(error=str(exc)), 502
     record_api_response(r)
     if not r.ok: return jsonify(error=f"OpenSubtitles returned {r.status_code}: {r.text[:200]}"),502
-    data=r.json().get("data",[])
+    try:
+        body=r.json()
+        if not isinstance(body, dict) or not isinstance(body.get("data", []), list): raise ValueError("invalid search response")
+        data=body.get("data", [])
+    except (ValueError, TypeError):
+        return jsonify(error="OpenSubtitles returned an invalid search response."), 502
     ranked=[]
     for item in data:
-        score=candidate_rank(item, params["query"], params.get("year"))
+        if imdb_id:
+            details = (item.get("attributes") or {}).get("feature_details") or {}
+            try:
+                if int(details.get("imdb_id", 0)) != imdb_id: continue
+            except (ValueError, TypeError):
+                continue
+            title = details.get("title") or ""
+            # An exact verified IMDb ID is authoritative when regional release years differ.
+            score = candidate_rank(item, title, None)
+        else:
+            score=candidate_rank(item, params["query"], params.get("year"))
         if score is not None: ranked.append((score, item))
     ranked.sort(key=lambda pair: pair[0], reverse=True)
     m["candidates"]=[]
@@ -311,7 +475,7 @@ def api_search():
         for file in files:
             if file.get("file_id") and str(file["file_id"]) not in rejected:
                 m["candidates"].append({"id":x["id"],"name":file.get("file_name") or attrs.get("release") or "candidate","download_id":file["file_id"],"download_count":attrs.get("download_count",0) or 0})
-    update_movie(p, {"candidates": m["candidates"]}); return jsonify(candidates=m["candidates"],lookups=load_state().get("api_lookups", 0))
+    update_movie(p, {"candidates": m["candidates"]}); return jsonify(candidates=m["candidates"], lookups=load_state().get("api_lookups", 0), page=page, total_pages=body.get("total_pages"), total_count=body.get("total_count"), matched_count=len(ranked))
 
 def preserve_legacy_track(p, movie):
     """Keep the one track retained by older versions, if it still exists."""
@@ -339,8 +503,10 @@ def select_track(movie, track_id):
     return True
 
 def download_candidate(p, m, candidate):
-    h={"Api-Key":os.getenv("OPENSUBTITLES_CONSUMER_KEY",os.getenv("OPENSUBTITLES_API_KEY","")),"User-Agent":os.getenv("OPENSUBTITLES_USER_AGENT","subtitle-alignment-local"),"Content-Type":"application/json"}
-    r=requests.post("https://api.opensubtitles.com/api/v1/download",json={"file_id":candidate.get("download_id")},headers=h,timeout=30)
+    try:
+        r=opensubtitles_request("post", "/download", json={"file_id":candidate.get("download_id")})
+    except OpenSubtitlesError as exc:
+        return False, str(exc)
     record_api_response(r, download=True)
     if not r.ok:
         try:
@@ -383,7 +549,9 @@ def download_candidate(p, m, candidate):
 def api_download():
     path=request.json.get("path"); p=movie_or_404(path); s=load_state(); m=s.get("movies",{}).get(str(p)); cand=(m or {}).get("candidates",[])
     if not p or not cand: return jsonify(error="Search for candidates first"),400
-    candidate=next((x for x in cand if str(x.get("download_id"))==str(request.json.get("file_id"))),cand[0])
+    requested_id=request.json.get("file_id")
+    candidate=next((x for x in cand if str(x.get("download_id"))==str(requested_id)), None) if requested_id is not None else cand[0]
+    if candidate is None: return jsonify(error="Selected candidate is no longer available; search again."), 409
     ok,error=download_candidate(p,m,candidate)
     if not ok: return jsonify(error=error),502
     update_movie(p, {k:m[k] for k in ("working_srt", "current_candidate_id", "current_candidate_name", "offset", "track_history")}); return jsonify(ok=True)
@@ -481,7 +649,7 @@ def cues():
             save_state(state)
         working = Path(m["working_srt"])
         return jsonify(cues=parse_srt(working.read_text(encoding="utf-8", errors="replace")), name=m.get("current_candidate_name", "Downloaded subtitle"),
-                       tracks=available_tracks(m, load_alignment_results().get(str(p), [])), current_id=m.get("current_candidate_id"))
+                       tracks=available_tracks(m, load_alignment_results().get(str(p), [])), current_id=m.get("current_candidate_id"), preferred_id=m.get("preferred_track_id"))
 
 @app.post("/api/select-track")
 def api_select_track():
@@ -491,6 +659,25 @@ def api_select_track():
         state=load_state(); movie=state.get("movies", {}).get(str(p))
         if not movie or not select_track(movie, data.get("id")):
             return jsonify(error="Subtitle track is unavailable"), 404
+        save_state(state)
+    return jsonify(ok=True)
+
+@app.post("/api/reject-track")
+def api_reject_track():
+    data=request.get_json() or {}; p=movie_or_404(data.get("path")); track_id=data.get("id")
+    if not p or track_id is None: return jsonify(error="Invalid movie or track"), 400
+    with lock:
+        state=load_state(); movie=state.get("movies", {}).get(str(p))
+        if not movie: return jsonify(error="Invalid movie"), 400
+        history=movie.get("track_history", [])
+        track=next((t for t in history if str(t.get("id")) == str(track_id)), None)
+        if not track: return jsonify(error="Subtitle track is unavailable"), 404
+        rejected=movie.setdefault("rejected_ids", [])
+        if str(track["id"]) not in set(map(str, rejected)): rejected.append(track["id"])
+        movie["candidates"]=[c for c in movie.get("candidates", []) if str(c.get("download_id")) != str(track_id)]
+        if str(movie.get("current_candidate_id")) == str(track_id):
+            for alternative in history:
+                if str(alternative.get("id")) not in set(map(str, rejected)) and select_track(movie, alternative["id"]): break
         save_state(state)
     return jsonify(ok=True)
 

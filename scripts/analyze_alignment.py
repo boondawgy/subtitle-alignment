@@ -124,16 +124,20 @@ def main():
         results.append(item);print(f"{len(results)}. {item['title']}",flush=True)
     results.sort(key=lambda x:x['title'].casefold())
     report={'generated_at':now(),'score_description':'Heuristic 0–100 text/timing fit; not a calibrated probability. Offset is added to subtitle times.','movies':results}
-    args.output.mkdir(parents=True,exist_ok=True);atomic_json(args.output/'report.json',report)
+    write_report(args.output, report)
+    print(f"Analyzed {len(results)} movies. Reports: {args.output/'report.md'} and {args.output/'report.json'}")
+
+def write_report(output, report):
+    output.mkdir(parents=True,exist_ok=True);atomic_json(output/'report.json',report)
     lines=['# Subtitle alignment review','',f"Generated: {report['generated_at']}",'','Scores are heuristic, not probabilities. Positive offsets move subtitles later; negative offsets move them earlier. Review before saving.','','| Movie | Track | Fit | Suggested offset | Evidence |','| --- | --- | ---: | ---: | --- |']
-    for movie in results:
+    for movie in report['movies']:
         for track in movie['tracks']:
             score=str(track['fit_score'])+'/100' if track.get('fit_score') is not None else 'Insufficient evidence'
             offset=f"{track['recommended_offset_seconds']:+.2f} s" if track.get('recommended_offset_seconds') is not None else '—'
             evidence=f"{track.get('matching_segments',0)} matches / {track.get('matching_sample_windows',0)} samples" + ('; timing may drift' if track.get('warning') else '')
             safe=lambda v:str(v).replace('|','\\|').replace('\n',' ')
             lines.append(f"| {safe(movie['title'])} | {safe(track.get('track_name') or 'Unknown')} | {score} | {offset} | {evidence} |")
-    (args.output/'report.md').write_text('\n'.join(lines)+'\n',encoding='utf-8')
-    print(f"Analyzed {len(results)} movies. Reports: {args.output/'report.md'} and {args.output/'report.json'}")
+    (output/'report.md').write_text('\n'.join(lines)+'\n',encoding='utf-8')
+
 
 if __name__=='__main__':main()

@@ -1,6 +1,6 @@
 # Overnight movie transcription
 
-This standalone script samples the cached list of movies missing subtitles. It transcribes the first 60 seconds, skips 300 seconds, then repeats (samples begin at 0:00, 6:00, 12:00, and so on). It does not approve or save movie subtitles and does not call OpenSubtitles. Movies whose subtitle checks have not finished are skipped until the library scan completes.
+This standalone script samples the cached list of movies missing subtitles. It transcribes the first 60 seconds, skips 300 seconds, then repeats (samples begin at 0:00, 6:00, 12:00, and so on). It does not approve or save movie subtitles and does not call OpenSubtitles. Movies whose subtitle checks have not finished are skipped until the library scan completes. Movies marked Pass in the app are skipped.
 
 ## Setup on the Mac
 
@@ -19,7 +19,7 @@ The first transcription run downloads the `tiny.en` model; it needs an internet 
 python -u scripts/transcribe_missing.py 2>&1 | tee -a transcriptions/run.log
 ```
 
-Keep the Mac awake and the share mounted. Close the laptop only if it is configured to stay awake. The process runs until all queued movies are processed or interrupted. Press Ctrl-C to stop; rerun the same command to resume completed samples. Failed movies are reported and the script continues. Run the command again to retry failures. `--limit 1` is useful for a trial run; `--model base.en` gives a larger, slower model. Changing the model or sampling parameters requires moving the existing movie JSON aside so different settings are not mixed.
+Keep the Mac awake and the share mounted. Close the laptop only if it is configured to stay awake. The process runs until all queued movies are processed or interrupted. Press Ctrl-C to stop; rerun the same command to resume completed samples. Failed movies are reported and the script continues. Run the command again to retry failures. `--limit 1` is useful for a trial run; repeat `--title "Exact movie title"` to target specific movies; `--model base.en` gives a larger, slower model. Changing the model or sampling parameters requires moving the existing movie JSON aside so different settings are not mixed.
 
 ## Movie order
 
